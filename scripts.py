@@ -1,6 +1,7 @@
-"""Данные, окно наблюдения, агрегаты и метрика"""
+"""Данные, окно наблюдения, метрика и временные разбиения"""
 
 
+import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -356,6 +357,41 @@ def fold_cookies(meta):
     return folds
 
 
+def fold_scores(predictions, fold, expected):
+    """Проверяет состав cookie и возвращает score в порядке ожидаемых cookie_id"""
+    part = predictions[predictions['fold'] == fold]
+    if part.empty:
+        raise ValueError(f'нет предсказаний разбиения {fold}')
+    if part['cookie_id'].duplicated().any():
+        raise ValueError(f'{fold}: повторные cookie_id в предсказаниях')
+    missing = expected.difference(part['cookie_id'])
+    extra = pd.Index(part['cookie_id']).difference(expected)
+    if len(missing) or len(extra):
+        raise ValueError(f'{fold}: не хватает {len(missing)} cookie, лишних {len(extra)}')
+    return part.set_index('cookie_id')['score'].loc[expected]
+
+
+def evaluate_folds(predictions, meta, folds):
+    """Метрики каждого разбиения и невзвешенное среднее основной метрики по разбиениям"""
+    # predictions: таблица fold, cookie_id, score по проверочным cookie; метки берутся из meta
+    if set(folds) != set(FOLDS):
+        raise ValueError(f'нужны ровно разбиения {sorted(FOLDS)}, получены {sorted(folds)}')
+    absent = {'fold', 'cookie_id', 'score'} - set(predictions.columns)
+    if absent:
+        raise ValueError(f'в предсказаниях нет столбцов: {sorted(absent)}')
+    unknown = set(predictions['fold']) - set(folds)
+    if unknown:
+        raise ValueError(f'в предсказаниях неизвестные разбиения: {sorted(unknown)}')
+    labels = indexed_by_cookie(meta)['target']
+    rows = {}
+    for fold, parts in folds.items():
+        score = fold_scores(predictions, fold, parts['valid'])
+        rows[fold] = evaluate_predictions(labels.loc[score.index], score)
+    table = pd.DataFrame.from_dict(rows, orient='index')
+    # NaN одного разбиения делает NaN и среднее, а не среднее оставшихся
+    return table, table['precision_at_recall_070'].mean(skipna=False)
+
+
 def slice_groups(features, meta):
     """Группы диагностических срезов из агрегатов разведочного анализа, индекс cookie_id"""
     is_web = features['platform'] == 'web'
@@ -370,3 +406,45 @@ def slice_groups(features, meta):
         'cookie_age': np.where(features['cookie_age_h'] < 24 * 7, 'до 7 дней', '7 дней и больше'),
         'day': indexed_by_cookie(meta)['window_start_ts'].dt.strftime('%Y-%m-%d'),
     }, index=features.index)
+
+
+def evaluate_slices(predictions, meta, groups):
+    """Метрики каждого непустого среза внутри каждого разбиения, всё сопоставлено по cookie_id"""
+    missing = pd.Index(predictions['cookie_id']).difference(groups.index)
+    if len(missing):
+        raise ValueError(f'у {len(missing)} cookie нет групп срезов')
+    labels = indexed_by_cookie(meta)['target']
+    rows = []
+    for column in groups.columns:
+        group = predictions['cookie_id'].map(groups[column]).rename('group')
+        for (fold, value), part in predictions.groupby([predictions['fold'], group]):
+            metrics = evaluate_predictions(part['cookie_id'].map(labels), part['score'])
+            rows.append({'fold': fold, 'slice': column, 'group': value, **metrics})
+    return pd.DataFrame(rows)
+
+
+def fit_predict_fold(model, frame, features, parts, weights=None):
+    """Обучает модель на train разбиения, возвращает score его valid и время двух шагов"""
+    train, valid = frame.loc[parts['train']], frame.loc[parts['valid']]
+    # Веса строк нормируются внутри обучающей части, проверка и её метрики идут без весов
+    fitted_weights = weights.loc[train.index] if weights is not None else None
+    options = {} if weights is None else {'sample_weight': fitted_weights / fitted_weights.mean()}
+    started = time.perf_counter()
+    model.fit(train[features], train['target'].astype(int), **options)
+    trained = time.perf_counter()
+    # Score это вероятность класса 1 без округления и перевода в ранги
+    score = model.predict_proba(valid[features])[:, 1]
+    return score, {'train_seconds': trained - started,
+                   'predict_seconds': time.perf_counter() - trained}
+
+
+def run_folds(make_model, frame, features, folds, weights=None):
+    """Обучает новую модель на каждом разбиении и собирает предсказания проверочных частей"""
+    # frame: признаки, target и window_start_ts по cookie_id
+    rows, timings = [], {}
+    for fold, parts in folds.items():
+        score, timings[fold] = fit_predict_fold(make_model(), frame, features, parts, weights)
+        valid = frame.loc[parts['valid'], ['window_start_ts', 'target']]
+        rows.append(valid.assign(fold=fold, score=score).reset_index())
+    columns = ['fold', 'cookie_id', 'window_start_ts', 'target', 'score']
+    return pd.concat(rows, ignore_index=True)[columns], timings
