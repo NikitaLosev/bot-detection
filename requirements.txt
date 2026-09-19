@@ -1,0 +1,8 @@
+catboost==1.2.10
+ipykernel==7.3.0
+matplotlib==3.11.2
+mlflow==3.16.1
+nbconvert==7.17.1
+numpy==2.5.3
+pandas==3.0.6
+scikit-learn==1.9.1
