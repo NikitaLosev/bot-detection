@@ -1,10 +1,12 @@
-"""Данные, окно наблюдения и агрегаты по cookie"""
+"""Данные, окно наблюдения, агрегаты и метрика"""
 
 
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
+# Исходная метрика задачи
+from bot_detection_challenge.metric import TARGET_RECALL, pr_curve, precision_at_recall, recall_at_fpr
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -53,6 +55,13 @@ FOLDS = {
     'fold_a': {'train': ('2026-04-06', '2026-04-09'), 'valid': ('2026-04-10', '2026-04-12')},
     'fold_b': {'train': ('2026-04-06', '2026-04-12'), 'valid': ('2026-04-13', '2026-04-16')},
 }
+
+
+# Диагностическая точка с условным порогом, recall 0.70 в ней не требуется
+DIAGNOSTIC_THRESHOLD = 0.5
+
+
+MAX_FALSE_POSITIVE_RATE = 0.01
 
 
 def read_meta(open_holdout=False):
@@ -235,6 +244,73 @@ def quickstart_features(events, meta):
     })
     # Cookie без событий в окне получает нули, как fillna(0) в базовой модели
     return features.reindex(meta['cookie_id'], fill_value=0)
+
+
+def check_predictions(y_true, score):
+    """Проверяет метки и score и возвращает одномерные массивы"""
+    y_true, score = np.asarray(y_true), np.asarray(score)
+    if y_true.ndim != 1 or score.ndim != 1:
+        raise ValueError('y_true и score должны быть одномерными')
+    if len(y_true) == 0 or len(y_true) != len(score):
+        raise ValueError('y_true и score должны быть непустыми и одной длины')
+    if not np.isin(y_true, (0, 1)).all():
+        raise ValueError('метки должны быть только 0 и 1, без пропусков')
+    if score.dtype.kind not in 'iuf' or not np.isfinite(score).all():
+        raise ValueError('score должен быть числом без пропусков и бесконечностей')
+    if ((score < 0) | (score > 1)).any():
+        raise ValueError('score должен лежать в [0, 1]')
+    return y_true.astype(int), score.astype(float)
+
+
+def tied_score_share(score):
+    """Доля строк, чей score встречается хотя бы у двух строк: [0.8, 0.8, 0.2] даёт 2/3"""
+    return float(pd.Series(score).duplicated(keep=False).mean())
+
+
+def official_point_recall(y_true, score):
+    """Recall точки, которую метрика выбрала на оцениваемых метках"""
+    # Та же pr_curve, что в metric.py: группы равных score уже учтены
+    precision, recall = pr_curve(y_true, score)
+    allowed = recall >= TARGET_RECALL
+    if not allowed.any():
+        return float('nan')
+    # Если максимум precision достигается в нескольких точках, берётся наибольший recall
+    best = precision[allowed] == precision[allowed].max()
+    return float(recall[allowed][best].max())
+
+
+def threshold_point(y_true, score):
+    """Precision, recall, F1 и доля ложно отмеченных людей при score >= 0.5"""
+    # zero_division=0: без отмеченных cookie precision 0, без ботов recall 0, F1 тогда тоже 0
+    flagged = (score >= DIAGNOSTIC_THRESHOLD).astype(int)
+    humans = y_true == 0
+    return {
+        'precision_at_05': float(precision_score(y_true, flagged, zero_division=0)),
+        'recall_at_05': float(recall_score(y_true, flagged, zero_division=0)),
+        'f1_at_05': float(f1_score(y_true, flagged, zero_division=0)),
+        # FP / (FP + TN), без людей в выборке не определена
+        'false_positive_rate_at_05': float(flagged[humans].mean()) if humans.any() else np.nan,
+    }
+
+
+def evaluate_predictions(y_true, score):
+    """Метрика задачи и диагностика для одной выборки уже сопоставленных cookie"""
+    y_true, score = check_predictions(y_true, score)
+    n_positive = int(y_true.sum())
+    both_classes = 0 < n_positive < len(y_true)
+    metrics = {
+        'n_cookies': len(y_true),
+        'n_positive': n_positive,
+        'precision_at_recall_070': precision_at_recall(y_true, score, recall=TARGET_RECALL),
+        'official_point_recall_on_eval': official_point_recall(y_true, score),
+        'roc_auc': float(roc_auc_score(y_true, score)) if both_classes else np.nan,
+        # AP в проекте и есть PR-AUC: ступенчатая сумма, а не площадь по трапециям
+        'average_precision': (
+            float(average_precision_score(y_true, score)) if n_positive else np.nan),
+        'recall_at_fpr_001': recall_at_fpr(y_true, score, fpr=MAX_FALSE_POSITIVE_RATE),
+        'tied_score_share': tied_score_share(score),
+    }
+    return metrics | threshold_point(y_true, score)
 
 
 def days_mask(meta, first_day, last_day):
