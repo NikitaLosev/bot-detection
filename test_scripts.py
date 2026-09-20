@@ -201,5 +201,22 @@ class TestWindow(unittest.TestCase):
         self.assertTrue(np.isnan(features.loc['c01', 'gap_median_s']))
 
 
+class TestFeatures(unittest.TestCase):
+    """Таблица признаков модели: фиксированный состав столбцов"""
+
+    def test_missing_event_type_gives_zero(self):
+        """Тип событий, которого нет в выборке, даёт нулевой счётчик, а не пропуск столбца"""
+        meta = toy_meta().head(1)
+        start = meta.loc[0, 'window_start_ts']
+        rows = [('c00', start, 'item_view'), ('c00', start + pd.Timedelta(minutes=1), 'login')]
+        clean = scripts.clean_events(scripts.window_events(toy_events(rows), meta))
+        features = scripts.model_features(clean, meta)
+        self.assertEqual(list(features.columns), scripts.MODEL_FEATURES)
+        self.assertEqual(features.loc['c00', 'n_photo_swipe'], 0)
+        self.assertEqual(features.loc['c00', 'share_photo_swipe'], 0)
+        self.assertEqual(features.loc['c00', 'n_events'], 2)
+        self.assertEqual(features.loc['c00', 'n_item_view'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

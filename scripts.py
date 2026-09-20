@@ -1,68 +1,54 @@
-"""Данные, окно наблюдения, метрика и временные разбиения"""
-
+"""Данные, признаки, метрика и временные разбиения"""
 
 import time
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
-# Исходная метрика задачи
-from bot_detection_challenge.metric import TARGET_RECALL, pr_curve, precision_at_recall, recall_at_fpr
+from catboost import CatBoostClassifier
+from sklearn.ensemble import VotingClassifier
+from sklearn.metrics import (
+    average_precision_score, f1_score, precision_score, recall_score, roc_auc_score,
+)
 
+# Исходная метрика задачи
+from bot_detection_challenge.metric import (
+    TARGET_RECALL, pr_curve, precision_at_recall, recall_at_fpr,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent
-
-
 DATA_DIR = REPO_ROOT / 'bot_detection_challenge' / 'data'
-
-
 META_DATES = ['cookie_created_at', 'window_start_ts', 'window_end_ts']
-
-
 # Последние три дня train закрыты при исследовании, обоснование в eda.ipynb
 HOLDOUT_START = pd.Timestamp('2026-04-17')
-
-
 # desktop и web, iphone и ios обозначают одну платформу
 PLATFORM_MAP = {'desktop': 'web', 'iphone': 'ios'}
-
-
 RAW_EVENT_COLUMNS = [
     'cookie_id', 'event_ts', 'eid', 'event_name', 'platform', 'user_agent',
     'item_id', 'item_category', 'item_location', 'seller_type',
     'search_query', 'search_page', 'pointer_x', 'pointer_y',
 ]
-
-
 # Словари заданы кодом нормализации, а не данными, поэтому не зависят от разбиения
 PLATFORMS = ['web', 'android', 'ios']
-
-
 UA_KINDS = ['browser', 'app', 'headless', 'http_lib']
-
-
 EVENT_TYPES = [
     'item_view', 'search_results_view', 'photo_swipe', 'favorite_add', 'seller_page_view',
     'contact_phone_show', 'contact_chat_open', 'contact_message_sent', 'login',
 ]
-
-
 # Наблюдаемые границы координат курсора, значения целые
 SCREEN_W, SCREEN_H = 1920, 1080
-
-
 # Внутренние разбиения: дни начала окна, обе даты включительно
 FOLDS = {
     'fold_a': {'train': ('2026-04-06', '2026-04-09'), 'valid': ('2026-04-10', '2026-04-12')},
     'fold_b': {'train': ('2026-04-06', '2026-04-12'), 'valid': ('2026-04-13', '2026-04-16')},
 }
-
-
 # Диагностическая точка с условным порогом, recall 0.70 в ней не требуется
 DIAGNOSTIC_THRESHOLD = 0.5
-
-
 MAX_FALSE_POSITIVE_RATE = 0.01
+# Финальная модель: среднее вероятностей трёх CatBoost на признаках model_features
+FINAL_PARAMS = {'iterations': 1500, 'depth': 6, 'learning_rate': 0.03, 'l2_leaf_reg': 10}
+FINAL_SEEDS = (0, 17, 42)
+THREADS = 4
 
 
 def read_meta(open_holdout=False):
@@ -234,6 +220,151 @@ def signal_table(frame, features, day_column='day'):
         'auc': [feature_auc(labeled, name) for name in features],
         'auc_day_min': by_day.min(), 'auc_day_max': by_day.max(),
     })
+
+
+def share_features(features):
+    """Доля каждого типа события среди событий cookie, без событий доли не определены"""
+    counts = features[[f'n_{name}' for name in EVENT_TYPES]]
+    shares = counts.div(features['n_events'].replace(0, np.nan), axis=0)
+    return shares.rename(columns=lambda name: name.replace('n_', 'share_', 1))
+
+
+def ratio_features(features):
+    """Отношения разнообразия к объёму: сколько разных объектов приходится на одно действие"""
+    views = features['n_item_view'].replace(0, np.nan)
+    searches = features['n_search_results_view'].replace(0, np.nan)
+    items = features['n_items'].replace(0, np.nan)
+    return pd.DataFrame({
+        'items_per_view': features['n_items'] / views,
+        'queries_per_search': features['n_queries'] / searches,
+        'locations_per_item': features['n_locations'] / items,
+        'categories_per_item': features['n_categories'] / items,
+    })
+
+
+def view_repeat_features(events, cookies):
+    """Доля повторных просмотров: сколько просмотров приходится на уже виденные объявления"""
+    views = events[events['event_name'] == 'item_view']
+    grouped = views.groupby('cookie_id')
+    # 0 означает, что каждое объявление открыто по одному разу, без просмотров не определено
+    repeat = 1 - grouped['item_id'].nunique() / grouped.size()
+    return repeat.rename('item_repeat_share').reindex(cookies).to_frame()
+
+
+def client_dummies(features):
+    """Бинарные признаки платформы и вида клиента по фиксированному словарю"""
+    columns = {f'platform_{value}': features['platform'] == value for value in PLATFORMS}
+    columns.update({f'ua_{value}': features['ua_kind'] == value for value in UA_KINDS})
+    return pd.DataFrame(columns).astype(int)
+
+
+def pointer_points(events):
+    """События web с координатами курсора в порядке времени внутри cookie"""
+    with_pointer = (events['platform_norm'] == 'web') & events['pointer_x'].notna()
+    return events.loc[with_pointer, ['cookie_id', 'pointer_x', 'pointer_y']]
+
+
+def cursor_spread_features(events, cookies):
+    """Число координат, их отсутствие на web, размах на единицу точек, квартили и положение"""
+    points = pointer_points(events)
+    grouped = points.groupby('cookie_id')
+    n_points = grouped.size()
+    # Без координат группировка пуста, поэтому столбцы квартилей задаются явно
+    quartiles = grouped['pointer_x'].quantile([0.25, 0.75]).unstack().reindex(columns=[0.25, 0.75])
+    # Независимые равномерные точки на отрезке дают ожидаемый размах L * (n - 1) / (n + 1)
+    expected_range = SCREEN_W * (n_points - 1) / (n_points + 1)
+    out = pd.DataFrame({
+        'pointer_range_x_norm': (grouped['pointer_x'].max() - grouped['pointer_x'].min())
+        / expected_range,
+        'pointer_iqr_x': quartiles[0.75] - quartiles[0.25],
+        'pointer_max_x': grouped['pointer_x'].max(),
+        'pointer_mean_x': grouped['pointer_x'].mean(),
+        'pointer_mean_y': grouped['pointer_y'].mean(),
+    }).where(n_points >= 2).reindex(cookies)
+    # Маска на размах и квартили уже наложена, счётчик точек добавляется после неё
+    out.insert(0, 'pointer_n', n_points.reindex(cookies, fill_value=0))
+    is_web = events.groupby('cookie_id')['platform_norm'].first().reindex(cookies) == 'web'
+    # Отсутствие координат осмысленно только на web, у мобильных cookie NaN
+    out.insert(1, 'pointer_absent', (out['pointer_n'] == 0).astype(float).where(is_web))
+    return out
+
+
+def cursor_edge_features(events, cookies):
+    """Доля и число событий с курсором на краю экрана, шаг между соседними координатами"""
+    points = pointer_points(events)
+    grouped = points.groupby('cookie_id')
+    step = np.sqrt(grouped['pointer_x'].diff() ** 2 + grouped['pointer_y'].diff() ** 2)
+    at_edge = points['pointer_x'].isin([0, SCREEN_W]) | points['pointer_y'].isin([0, SCREEN_H])
+    edges = at_edge.groupby(points['cookie_id'])
+    out = pd.DataFrame({
+        'pointer_edge_share': edges.mean(),
+        'pointer_edge_n': edges.sum(),
+        'pointer_step_mean': step.groupby(points['cookie_id']).mean(),
+        'pointer_step_median': step.groupby(points['cookie_id']).median(),
+    }).reindex(cookies)
+    # Число событий на краю это счётчик, без координат оно равно нулю
+    out['pointer_edge_n'] = out['pointer_edge_n'].fillna(0).astype(int)
+    return out
+
+
+def share_of(mask, base, cookie):
+    """Доля событий mask среди событий base по cookie, без базы доля не определена"""
+    return mask.groupby(cookie).sum() / base.groupby(cookie).sum().replace(0, np.nan)
+
+
+def geo_category_features(events, cookies):
+    """Локации на категорию, доля главного города и смены локации и категории"""
+    cookie = events['cookie_id']
+    location, category = events['item_location'], events['item_category']
+    prev_location = location.groupby(cookie).shift()
+    prev_category = category.groupby(cookie).shift()
+    both_location = location.notna() & prev_location.notna()
+    both_category = category.notna() & prev_category.notna()
+    grouped = events.groupby('cookie_id')
+    top_location = events.groupby(['cookie_id', 'item_location']).size().groupby(level=0).max()
+    out = pd.DataFrame({
+        'loc_per_cat': grouped['item_location'].nunique()
+        / grouped['item_category'].nunique().replace(0, np.nan),
+        'top_loc_share': top_location / location.notna().groupby(cookie).sum().replace(0, np.nan),
+        'loc_switch_share': share_of((location != prev_location) & both_location,
+                                     both_location, cookie),
+        'cat_switch_share': share_of((category != prev_category) & both_category,
+                                     both_category, cookie),
+    })
+    return out.reindex(cookies)
+
+
+# Семейства признаков финальной модели в том порядке, в каком они добавлялись в экспериментах
+FEATURE_FAMILIES = {
+    'объём': ['n_events', 'n_items'],
+    'состав действий': [f'n_{name}' for name in EVENT_TYPES]
+    + [f'share_{name}' for name in EVENT_TYPES],
+    'разнообразие': ['n_categories', 'n_locations', 'n_queries', 'page_mean', 'page_max',
+                     'items_per_view', 'item_repeat_share', 'queries_per_search',
+                     'locations_per_item', 'categories_per_item'],
+    'ритм': ['gap_median_s', 'gap_cv', 'share_gap_le_1s', 'span_min', 'max_events_per_min'],
+    'возраст': ['cookie_age_h'],
+    'клиент': [f'platform_{value}' for value in PLATFORMS]
+    + [f'ua_{value}' for value in UA_KINDS] + ['n_user_agents'],
+    'курсор': ['pointer_share', 'pointer_std_x', 'pointer_std_y'],
+    'курсор на краю': ['pointer_edge_share', 'pointer_edge_n', 'pointer_step_mean',
+                       'pointer_step_median'],
+    'разброс курсора': ['pointer_n', 'pointer_absent', 'pointer_range_x_norm', 'pointer_iqr_x',
+                        'pointer_max_x', 'pointer_mean_x', 'pointer_mean_y'],
+    'география': ['loc_per_cat', 'top_loc_share', 'loc_switch_share', 'cat_switch_share'],
+}
+MODEL_FEATURES = [name for family in FEATURE_FAMILIES.values() for name in family]
+
+
+def model_features(events, meta):
+    """Признаки финальной модели по cookie: 62 столбца в порядке FEATURE_FAMILIES"""
+    features = cookie_features(events, meta)
+    extra = [share_features(features), ratio_features(features), client_dummies(features),
+             view_repeat_features(events, features.index),
+             cursor_spread_features(events, features.index),
+             cursor_edge_features(events, features.index),
+             geo_category_features(events, features.index)]
+    return features.join(extra)[MODEL_FEATURES]
 
 
 def quickstart_features(events, meta):
@@ -448,3 +579,20 @@ def run_folds(make_model, frame, features, folds, weights=None):
         rows.append(valid.assign(fold=fold, score=score).reset_index())
     columns = ['fold', 'cookie_id', 'window_start_ts', 'target', 'score']
     return pd.concat(rows, ignore_index=True)[columns], timings
+
+
+def catboost_model(params, seed):
+    """CatBoost на CPU с явным seed и числом потоков, без ранней остановки"""
+    return CatBoostClassifier(**params, random_seed=seed, task_type='CPU', thread_count=THREADS,
+                              verbose=0, allow_writing_files=False)
+
+
+def seed_average(params, seeds=FINAL_SEEDS):
+    """Среднее вероятностей CatBoost с одними параметрами по нескольким seed"""
+    models = [(f'seed_{seed}', catboost_model(params, seed)) for seed in seeds]
+    return VotingClassifier(models, voting='soft')
+
+
+def final_model():
+    """Финальная модель: усреднение трёх CatBoost на FINAL_PARAMS"""
+    return seed_average(FINAL_PARAMS)
